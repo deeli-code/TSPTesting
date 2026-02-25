@@ -70,13 +70,13 @@ static inline double euclideanDist(const City& a, const City& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
-// Returns the total length of a tour (including the return edge to the start).
+// Returns the total length of a tour (open path, no return edge to the start).
 static double tourLength(const Tour& tour,
                          const std::vector<std::vector<double>>& dist) {
     double total = 0.0;
     const int n = static_cast<int>(tour.size());
-    for (int i = 0; i < n; ++i)
-        total += dist[tour[i]][tour[(i + 1) % n]];
+    for (int i = 0; i < n - 1; ++i)
+        total += dist[tour[i]][tour[i + 1]];
     return total;
 }
 
