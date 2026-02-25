@@ -64,11 +64,21 @@ using Tour = std::vector<int>;
 
 // ──────────────────────────────── helper functions ───────────────────────────
 
-// Returns the Euclidean distance between two cities.
-static inline double euclideanDist(const City& a, const City& b) {
-    const double dx = a.x - b.x;
-    const double dy = a.y - b.y;
-    return std::sqrt(dx * dx + dy * dy);
+// Returns the geographic (great-circle) distance in kilometres between two
+// cities whose x and y fields represent latitude and longitude in degrees,
+// using the Haversine formula.
+static inline double geographicDist(const City& a, const City& b) {
+    constexpr double kEarthRadiusKm = 6371.0;
+    constexpr double kPi = 3.14159265358979323846;
+    const double lat1 = a.x * kPi / 180.0;
+    const double lat2 = b.x * kPi / 180.0;
+    const double dLat = (b.x - a.x) * kPi / 180.0;
+    const double dLon = (b.y - a.y) * kPi / 180.0;
+    const double sinDLat = std::sin(dLat / 2.0);
+    const double sinDLon = std::sin(dLon / 2.0);
+    const double h = sinDLat * sinDLat
+                   + std::cos(lat1) * std::cos(lat2) * sinDLon * sinDLon;
+    return 2.0 * kEarthRadiusKm * std::asin(std::sqrt(h));
 }
 
 // Returns the total length of a tour (open path, no return edge to the start).
@@ -96,7 +106,7 @@ static void computeDistRows(const std::vector<City>& cities,
     for (int i = rowStart; i < rowEnd; ++i) {
         distMatrix[i][i] = 0.0;
         for (int j = i + 1; j < n; ++j)
-            distMatrix[i][j] = euclideanDist(cities[i], cities[j]);
+            distMatrix[i][j] = geographicDist(cities[i], cities[j]);
     }
 }
 
