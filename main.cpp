@@ -25,16 +25,23 @@
 //                     slice), each processed by a dedicated thread with its own
 //                     independent RNG seeded from the master generator.
 //
-// Input file format:
-//   One city per line in CSV format: <id>,<x>,<y>,,,,,, (trailing commas/fields
-//   are ignored).  The first field is a numeric city ID and is discarded.
+// Input file formats:
+//   City file – one city per line in CSV format: <id>,<x>,<y>,,,,,, (trailing
+//   commas/fields are ignored).  The first field is a numeric city ID and is
+//   discarded.  x is treated as latitude and y as longitude in decimal degrees.
+//
+//   Distance matrix file (optional) – an n×n CSV where value at row i, column j
+//   is the pre-calculated distance from city i to city j.  When supplied, city
+//   coordinates are not required and distances are not computed; the number of
+//   cities is inferred from the matrix dimensions.
 //
 // Build:
 //   g++ -std=c++17 -O2 -pthread -o tsp main.cpp
 //
 // Usage:
-//   ./tsp [input_file] [output_file] [pop_size] [max_gen] [mut_rate]
-//   Defaults: cities.txt  result.txt  200  500  0.02
+//   ./tsp [input_file] [output_file] [pop_size] [max_gen] [mut_rate] [dist_csv]
+//   Defaults: cities.txt  result.txt  200  500  0.02  (no distance CSV)
+//   When dist_csv is provided the city input_file is ignored.
 
 #include <algorithm>
 #include <chrono>
@@ -327,6 +334,52 @@ static void writeTour(const std::string& path,
         fout << city << "\n";
 }
 
+// Reads a pre-computed n×n distance matrix from a CSV file.
+// Each row i contains n comma-separated values where column j is the distance
+// from city i to city j.
+// Throws std::runtime_error if the file cannot be opened, is not square,
+// or contains no valid data.
+static std::vector<std::vector<double>> readDistMatrix(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin.is_open())
+        throw std::runtime_error("Cannot open distance matrix file: " + path);
+
+    std::vector<std::vector<double>> mat;
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        std::istringstream ss(line);
+        std::vector<double> row;
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            try {
+                row.push_back(std::stod(token));
+            } catch (...) {
+                throw std::runtime_error(
+                    "Invalid value in distance matrix file: " + token);
+            }
+        }
+        if (!row.empty())
+            mat.push_back(std::move(row));
+    }
+
+    if (mat.empty())
+        throw std::runtime_error(
+            "No data found in distance matrix file: " + path);
+
+    // Verify the matrix is square.
+    const std::size_t n = mat.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (mat[i].size() != n)
+            throw std::runtime_error(
+                "Distance matrix is not square (row " + std::to_string(i) +
+                " has " + std::to_string(mat[i].size()) +
+                " columns, expected " + std::to_string(n) + ")");
+    }
+
+    return mat;
+}
+
 // ────────────────────────────────── main ─────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -336,26 +389,43 @@ int main(int argc, char* argv[]) {
     int         popSize    = 200;
     int         maxGen     = 500;
     double      mutRate    = 0.02;
+    std::string distCsvFile;  // empty = compute distances from coordinates
 
-    if (argc >= 2) inputFile  = argv[1];
-    if (argc >= 3) outputFile = argv[2];
-    if (argc >= 4) popSize    = std::atoi(argv[3]);
-    if (argc >= 5) maxGen     = std::atoi(argv[4]);
-    if (argc >= 6) mutRate    = std::atof(argv[5]);
+    if (argc >= 2) inputFile   = argv[1];
+    if (argc >= 3) outputFile  = argv[2];
+    if (argc >= 4) popSize     = std::atoi(argv[3]);
+    if (argc >= 5) maxGen      = std::atoi(argv[4]);
+    if (argc >= 6) mutRate     = std::atof(argv[5]);
+    if (argc >= 7) distCsvFile = argv[6];
 
-    // ── load cities ──────────────────────────────────────────────────────────
-    std::vector<City> cities;
-    try {
-        cities = readCities(inputFile);
-    } catch (const std::runtime_error& e) {
-        std::cerr << "[error] " << e.what() << "\n";
-        return EXIT_FAILURE;
+    // ── build or load distance matrix ────────────────────────────────────────
+    std::vector<std::vector<double>> distMatrix;
+    int numCities = 0;
+
+    if (!distCsvFile.empty()) {
+        // Use pre-calculated distances from CSV; city coordinates not needed.
+        try {
+            distMatrix = readDistMatrix(distCsvFile);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[error] " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        numCities = static_cast<int>(distMatrix.size());
+        std::cout << "Loaded pre-calculated distance matrix for "
+                  << numCities << " cities.\n";
+    } else {
+        // Compute distances from city coordinates.
+        std::vector<City> cities;
+        try {
+            cities = readCities(inputFile);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[error] " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        numCities = static_cast<int>(cities.size());
+        std::cout << "Loaded " << numCities << " cities.\n";
+        distMatrix = buildDistanceMatrix(cities);
     }
-    const int numCities = static_cast<int>(cities.size());
-    std::cout << "Loaded " << numCities << " cities.\n";
-
-    // ── build distance matrix in parallel (mutex-free) ───────────────────────
-    const auto distMatrix = buildDistanceMatrix(cities);
 
     // ── initialise population ────────────────────────────────────────────────
     std::mt19937 masterRng(std::random_device{}());
