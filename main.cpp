@@ -26,8 +26,8 @@
 //                     independent RNG seeded from the master generator.
 //
 // Input file format:
-//   One city per line, each line containing two floating-point numbers separated
-//   by whitespace: <x> <y>
+//   One city per line in CSV format: <id>,<x>,<y>,,,,,, (trailing commas/fields
+//   are ignored).  The first field is a numeric city ID and is discarded.
 //
 // Build:
 //   g++ -std=c++17 -O2 -pthread -o tsp main.cpp
@@ -46,6 +46,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -264,7 +265,8 @@ static void evolveChunk(const std::vector<Tour>& currentPop,
 
 // ─────────────────────────────── file I/O ────────────────────────────────────
 
-// Reads city coordinates from a whitespace-separated text file.
+// Reads city coordinates from a CSV file where each line has the format:
+//   <id>,<x>,<y>,,,,,, (any trailing comma-separated fields are ignored).
 // Throws std::runtime_error if the file cannot be opened or contains no data.
 static std::vector<City> readCities(const std::string& path) {
     std::ifstream fin(path);
@@ -272,9 +274,27 @@ static std::vector<City> readCities(const std::string& path) {
         throw std::runtime_error("Cannot open input file: " + path);
 
     std::vector<City> cities;
-    City c;
-    while (fin >> c.x >> c.y)
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        // Parse: id,x,y,...
+        std::istringstream ss(line);
+        std::string token;
+        // Skip id field
+        if (!std::getline(ss, token, ',')) continue;
+        // Read x
+        std::string xStr, yStr;
+        if (!std::getline(ss, xStr, ',')) continue;
+        if (!std::getline(ss, yStr, ',')) continue;
+        City c;
+        try {
+            c.x = std::stod(xStr);
+            c.y = std::stod(yStr);
+        } catch (...) {
+            continue;
+        }
         cities.push_back(c);
+    }
 
     if (cities.empty())
         throw std::runtime_error("No valid city data found in file: " + path);
