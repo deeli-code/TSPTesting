@@ -82,17 +82,21 @@ static double tourLength(const Tour& tour,
 
 // ─────────────────────── parallel distance matrix ────────────────────────────
 
-// Worker function: fills rows [rowStart, rowEnd) of the distance matrix.
-// Each thread receives an exclusive, non-overlapping row range, so no mutex
-// is required for concurrent writes.
+// Worker function: fills the upper triangle of rows [rowStart, rowEnd).
+// Computing only i ≤ j halves the number of sqrt calls versus computing the
+// full row.  Each thread writes exclusively to its own row range (dist[i][j]
+// for j ≥ i), so no synchronisation is required.  The lower triangle is
+// filled by a sequential mirror pass after all threads have finished.
 static void computeDistRows(const std::vector<City>& cities,
                             std::vector<std::vector<double>>& distMatrix,
                             int rowStart,
                             int rowEnd) {
     const int n = static_cast<int>(cities.size());
-    for (int i = rowStart; i < rowEnd; ++i)
-        for (int j = 0; j < n; ++j)
+    for (int i = rowStart; i < rowEnd; ++i) {
+        distMatrix[i][i] = 0.0;
+        for (int j = i + 1; j < n; ++j)
             distMatrix[i][j] = euclideanDist(cities[i], cities[j]);
+    }
 }
 
 // Builds and returns the full n×n distance matrix using as many threads as
@@ -126,10 +130,43 @@ buildDistanceMatrix(const std::vector<City>& cities) {
     for (auto& thr : threads)
         thr.join();
 
+    // Mirror upper triangle to lower triangle (no sqrt required).
+    for (int i = 1; i < n; ++i)
+        for (int j = 0; j < i; ++j)
+            dist[i][j] = dist[j][i];
+
     return dist;
 }
 
 // ──────────────────────────── genetic-algorithm operators ────────────────────
+
+// 2-opt local search: repeatedly reverses a sub-segment of the tour whenever
+// doing so strictly reduces the total path length, until no improving move
+// remains.  Operates on the open-path formulation (no closing edge).
+// Time per call: O(n²) per improvement pass; typically converges in a few passes.
+static void twoOptImprove(Tour& tour,
+                          const std::vector<std::vector<double>>& dist) {
+    const int n = static_cast<int>(tour.size());
+    if (n < 4) return;
+    bool improved = true;
+    while (improved) {
+        improved = false;
+        for (int i = 0; i < n - 2; ++i) {
+            for (int j = i + 2; j < n - 1; ++j) {
+                // Current cost of edges (i→i+1) and (j→j+1).
+                const double before = dist[tour[i]][tour[i + 1]]
+                                    + dist[tour[j]][tour[j + 1]];
+                // Cost after reversing segment [i+1 .. j].
+                const double after  = dist[tour[i]][tour[j]]
+                                    + dist[tour[i + 1]][tour[j + 1]];
+                if (after < before - 1e-10) {
+                    std::reverse(tour.begin() + i + 1, tour.begin() + j + 1);
+                    improved = true;
+                }
+            }
+        }
+    }
+}
 
 // Creates an initial population of random tours.
 static std::vector<Tour>
@@ -169,18 +206,24 @@ static Tour orderCrossover(const Tour& parentA,
 
     // Start with an empty child; -1 marks unfilled positions.
     Tour child(n, -1);
+    // O(1) membership test replaces the previous O(n) std::find call,
+    // reducing the overall crossover from O(n²) to O(n).
+    std::vector<bool> inChild(n, false);
 
     // Copy the segment [lo, hi] from parentA.
-    for (int i = lo; i <= hi; ++i)
+    for (int i = lo; i <= hi; ++i) {
         child[i] = parentA[i];
+        inChild[parentA[i]] = true;
+    }
 
     // Fill remaining positions in the order cities appear in parentB,
     // skipping any city already present in the child.
     int pos = (hi + 1) % n;
     for (int k = 0; k < n; ++k) {
         const int city = parentB[(hi + 1 + k) % n];
-        if (std::find(child.begin(), child.end(), city) == child.end()) {
+        if (!inChild[city]) {
             child[pos] = city;
+            inChild[city] = true;
             pos = (pos + 1) % n;
         }
     }
@@ -314,6 +357,10 @@ int main(int argc, char* argv[]) {
         if (fitness[eliteIdx] < bestLength) {
             bestLength = fitness[eliteIdx];
             bestTour   = population[eliteIdx];
+            // Locally optimise the new best tour with 2-opt so that
+            // elitism propagates an improved solution each generation.
+            twoOptImprove(bestTour, distMatrix);
+            bestLength = tourLength(bestTour, distMatrix);
         }
 
         // Log progress at the first generation, every 50 thereafter, and at the end.
