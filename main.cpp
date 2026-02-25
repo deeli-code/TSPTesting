@@ -1,0 +1,529 @@
+// main.cpp – Traveling Salesman Problem (TSP) Solver using a Parallel Genetic Algorithm
+//
+// Overview:
+//   Reads a list of cities with (x, y) coordinates from a text file, builds a
+//   pairwise distance matrix in parallel, then evolves a population of candidate
+//   tours using a genetic algorithm until a maximum generation count is reached.
+//   The best tour found and its total length are written to an output file.
+//   Per-generation logging is printed to stdout so convergence can be monitored.
+//
+// Genetic-algorithm operators:
+//   Selection  – Tournament selection: the shorter of two randomly chosen tours wins.
+//   Crossover  – Order Crossover (OX1): copies a random segment from parent A, then
+//                fills the remaining positions in the order they appear in parent B,
+//                guaranteeing a valid (no duplicate city) permutation.
+//   Mutation   – Swap mutation: with a small probability, two random cities in the
+//                tour are swapped.
+//   Elitism    – The single best tour of each generation is always carried forward,
+//                preventing loss of the current best solution.
+//
+// Parallelism (mutex-free):
+//   Distance matrix – rows are divided among threads; each thread writes only its
+//                     own rows, so no mutex or atomic is needed.
+//   Evolution step  – the new generation is split into equal-sized chunks that
+//                     collectively cover exactly the whole population (no empty
+//                     slice), each processed by a dedicated thread with its own
+//                     independent RNG seeded from the master generator.
+//
+// Input file formats:
+//   City file – one city per line in CSV format: <id>,<x>,<y>,,,,,, (trailing
+//   commas/fields are ignored).  The first field is a numeric city ID and is
+//   discarded.  x is treated as latitude and y as longitude in decimal degrees.
+//
+//   Distance matrix file (optional) – an n×n CSV where value at row i, column j
+//   is the pre-calculated distance from city i to city j.  When supplied, city
+//   coordinates are not required and distances are not computed; the number of
+//   cities is inferred from the matrix dimensions.
+//
+// Build:
+//   g++ -std=c++17 -O2 -pthread -o tsp main.cpp
+//
+// Usage:
+//   ./tsp [input_file] [output_file] [pop_size] [max_gen] [mut_rate] [dist_csv]
+//   Defaults: cities.txt  result.txt  200  500  0.02  (no distance CSV)
+//   When dist_csv is provided the city input_file is ignored.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ─────────────────────────────── data structures ─────────────────────────────
+
+struct City {
+    double x{};
+    double y{};
+};
+
+// A Tour is a permutation of city indices in [0, numCities).
+using Tour = std::vector<int>;
+
+// ──────────────────────────────── helper functions ───────────────────────────
+
+// Returns the geographic (great-circle) distance in kilometres between two
+// cities whose x and y fields represent latitude and longitude in degrees,
+// using the Haversine formula.
+static inline double geographicDist(const City& a, const City& b) {
+    constexpr double kEarthRadiusKm = 6371.0;
+    constexpr double kPi = 3.14159265358979323846;
+    const double lat1 = a.x * kPi / 180.0;
+    const double lat2 = b.x * kPi / 180.0;
+    const double dLat = (b.x - a.x) * kPi / 180.0;
+    const double dLon = (b.y - a.y) * kPi / 180.0;
+    const double sinDLat = std::sin(dLat / 2.0);
+    const double sinDLon = std::sin(dLon / 2.0);
+    const double h = sinDLat * sinDLat
+                   + std::cos(lat1) * std::cos(lat2) * sinDLon * sinDLon;
+    return 2.0 * kEarthRadiusKm * std::asin(std::sqrt(h));
+}
+
+// Returns the total length of a tour (open path, no return edge to the start).
+static double tourLength(const Tour& tour,
+                         const std::vector<std::vector<double>>& dist) {
+    double total = 0.0;
+    const int n = static_cast<int>(tour.size());
+    for (int i = 0; i < n - 1; ++i)
+        total += dist[tour[i]][tour[i + 1]];
+    return total;
+}
+
+// ─────────────────────── parallel distance matrix ────────────────────────────
+
+// Worker function: fills the upper triangle of rows [rowStart, rowEnd).
+// Computing only i ≤ j halves the number of sqrt calls versus computing the
+// full row.  Each thread writes exclusively to its own row range (dist[i][j]
+// for j ≥ i), so no synchronisation is required.  The lower triangle is
+// filled by a sequential mirror pass after all threads have finished.
+static void computeDistRows(const std::vector<City>& cities,
+                            std::vector<std::vector<double>>& distMatrix,
+                            int rowStart,
+                            int rowEnd) {
+    const int n = static_cast<int>(cities.size());
+    for (int i = rowStart; i < rowEnd; ++i) {
+        distMatrix[i][i] = 0.0;
+        for (int j = i + 1; j < n; ++j)
+            distMatrix[i][j] = geographicDist(cities[i], cities[j]);
+    }
+}
+
+// Builds and returns the full n×n distance matrix using as many threads as
+// there are hardware cores (capped at n so no thread gets an empty range).
+static std::vector<std::vector<double>>
+buildDistanceMatrix(const std::vector<City>& cities) {
+    const int n = static_cast<int>(cities.size());
+    std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
+
+    // Never spawn more threads than there are rows to process.
+    const int hwThreads = static_cast<int>(std::thread::hardware_concurrency());
+    const int numThreads = std::max(1, std::min(hwThreads, n));
+
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+
+    // Distribute rows as evenly as possible; earlier threads get one extra row
+    // when the row count is not evenly divisible.
+    const int chunkSize = n / numThreads;
+    const int remainder = n % numThreads;
+    int rowStart = 0;
+    for (int t = 0; t < numThreads; ++t) {
+        const int rowEnd = rowStart + chunkSize + (t < remainder ? 1 : 0);
+        threads.emplace_back(computeDistRows,
+                             std::cref(cities),
+                             std::ref(dist),
+                             rowStart,
+                             rowEnd);
+        rowStart = rowEnd;
+    }
+    for (auto& thr : threads)
+        thr.join();
+
+    // Mirror upper triangle to lower triangle (no sqrt required).
+    for (int i = 1; i < n; ++i)
+        for (int j = 0; j < i; ++j)
+            dist[i][j] = dist[j][i];
+
+    return dist;
+}
+
+// ──────────────────────────── genetic-algorithm operators ────────────────────
+
+// 2-opt local search: repeatedly reverses a sub-segment of the tour whenever
+// doing so strictly reduces the total path length, until no improving move
+// remains.  Operates on the open-path formulation (no closing edge).
+// Time per call: O(n²) per improvement pass; typically converges in a few passes.
+static void twoOptImprove(Tour& tour,
+                          const std::vector<std::vector<double>>& dist) {
+    const int n = static_cast<int>(tour.size());
+    if (n < 4) return;
+    bool improved = true;
+    while (improved) {
+        improved = false;
+        for (int i = 0; i < n - 2; ++i) {
+            for (int j = i + 2; j < n - 1; ++j) {
+                // Current cost of edges (i→i+1) and (j→j+1).
+                const double before = dist[tour[i]][tour[i + 1]]
+                                    + dist[tour[j]][tour[j + 1]];
+                // Cost after reversing segment [i+1 .. j].
+                const double after  = dist[tour[i]][tour[j]]
+                                    + dist[tour[i + 1]][tour[j + 1]];
+                if (after < before - 1e-10) {
+                    std::reverse(tour.begin() + i + 1, tour.begin() + j + 1);
+                    improved = true;
+                }
+            }
+        }
+    }
+}
+
+// Creates an initial population of random tours.
+static std::vector<Tour>
+initPopulation(int popSize, int numCities, std::mt19937& rng) {
+    Tour base(numCities);
+    std::iota(base.begin(), base.end(), 0);  // 0, 1, 2, …, numCities-1
+
+    std::vector<Tour> pop(popSize, base);
+    for (auto& tour : pop)
+        std::shuffle(tour.begin(), tour.end(), rng);
+    return pop;
+}
+
+// Tournament selection: returns a reference to the better (shorter) of two
+// randomly chosen individuals in the current population.
+static const Tour&
+tournamentSelect(const std::vector<Tour>& pop,
+                 const std::vector<double>& fitness,
+                 std::mt19937& rng) {
+    std::uniform_int_distribution<int> pick(0,
+                                            static_cast<int>(pop.size()) - 1);
+    const int a = pick(rng);
+    const int b = pick(rng);
+    return fitness[a] < fitness[b] ? pop[a] : pop[b];
+}
+
+// Order Crossover (OX1): copies a random contiguous segment from parentA, then
+// fills the remaining positions in the order the cities appear in parentB.
+// The result is always a valid permutation (every city appears exactly once).
+static Tour orderCrossover(const Tour& parentA,
+                           const Tour& parentB,
+                           std::mt19937& rng) {
+    const int n = static_cast<int>(parentA.size());
+    std::uniform_int_distribution<int> pick(0, n - 1);
+    int lo = pick(rng), hi = pick(rng);
+    if (lo > hi) std::swap(lo, hi);
+
+    // Start with an empty child; -1 marks unfilled positions.
+    Tour child(n, -1);
+    // O(1) membership test replaces the previous O(n) std::find call,
+    // reducing the overall crossover from O(n²) to O(n).
+    std::vector<bool> inChild(n, false);
+
+    // Copy the segment [lo, hi] from parentA.
+    for (int i = lo; i <= hi; ++i) {
+        child[i] = parentA[i];
+        inChild[parentA[i]] = true;
+    }
+
+    // Fill remaining positions in the order cities appear in parentB,
+    // skipping any city already present in the child.
+    int pos = (hi + 1) % n;
+    for (int k = 0; k < n; ++k) {
+        const int city = parentB[(hi + 1 + k) % n];
+        if (!inChild[city]) {
+            child[pos] = city;
+            inChild[city] = true;
+            pos = (pos + 1) % n;
+        }
+    }
+    return child;
+}
+
+// Swap mutation: with probability mutationRate, swaps two randomly chosen
+// cities in the tour in place.
+static void swapMutate(Tour& tour, double mutationRate, std::mt19937& rng) {
+    std::uniform_real_distribution<double> prob(0.0, 1.0);
+    if (prob(rng) < mutationRate) {
+        std::uniform_int_distribution<int> pick(0,
+                                                static_cast<int>(tour.size()) - 1);
+        std::swap(tour[pick(rng)], tour[pick(rng)]);
+    }
+}
+
+// ────────────────────────── parallel evolution step ──────────────────────────
+
+// Worker function: fills nextPop[lo..hi) with offspring produced by
+// tournament selection, OX1 crossover, and swap mutation.
+// Each thread receives its own seeded RNG so there is no shared mutable state.
+static void evolveChunk(const std::vector<Tour>& currentPop,
+                        const std::vector<double>& fitness,
+                        std::vector<Tour>& nextPop,
+                        double mutationRate,
+                        int lo,
+                        int hi,
+                        unsigned seed) {
+    std::mt19937 rng(seed);
+    for (int i = lo; i < hi; ++i) {
+        const Tour& p1 = tournamentSelect(currentPop, fitness, rng);
+        const Tour& p2 = tournamentSelect(currentPop, fitness, rng);
+        nextPop[i] = orderCrossover(p1, p2, rng);
+        swapMutate(nextPop[i], mutationRate, rng);
+    }
+}
+
+// ─────────────────────────────── file I/O ────────────────────────────────────
+
+// Reads city coordinates from a CSV file where each line has the format:
+//   <id>,<x>,<y>,,,,,, (any trailing comma-separated fields are ignored).
+// Throws std::runtime_error if the file cannot be opened or contains no data.
+static std::vector<City> readCities(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin.is_open())
+        throw std::runtime_error("Cannot open input file: " + path);
+
+    std::vector<City> cities;
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        // Parse: id,x,y,...
+        std::istringstream ss(line);
+        std::string token;
+        // Skip id field
+        if (!std::getline(ss, token, ',')) continue;
+        // Read x
+        std::string xStr, yStr;
+        if (!std::getline(ss, xStr, ',')) continue;
+        if (!std::getline(ss, yStr, ',')) continue;
+        City c;
+        try {
+            c.x = std::stod(xStr);
+            c.y = std::stod(yStr);
+        } catch (...) {
+            continue;
+        }
+        cities.push_back(c);
+    }
+
+    if (cities.empty())
+        throw std::runtime_error("No valid city data found in file: " + path);
+    return cities;
+}
+
+// Writes the best tour and its total length to a text file.
+// Throws std::runtime_error if the file cannot be opened.
+static void writeTour(const std::string& path,
+                      const Tour& tour,
+                      double length) {
+    std::ofstream fout(path);
+    if (!fout.is_open())
+        throw std::runtime_error("Cannot open output file: " + path);
+
+    fout << std::fixed << std::setprecision(4);
+    fout << "Best tour length: " << length << "\n";
+    fout << "Tour order (0-indexed city indices):\n";
+    for (const int city : tour)
+        fout << city << "\n";
+}
+
+// Reads a pre-computed n×n distance matrix from a CSV file.
+// Each row i contains n comma-separated values where column j is the distance
+// from city i to city j.
+// Throws std::runtime_error if the file cannot be opened, is not square,
+// or contains no valid data.
+static std::vector<std::vector<double>> readDistMatrix(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin.is_open())
+        throw std::runtime_error("Cannot open distance matrix file: " + path);
+
+    std::vector<std::vector<double>> mat;
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        std::istringstream ss(line);
+        std::vector<double> row;
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            try {
+                row.push_back(std::stod(token));
+            } catch (...) {
+                throw std::runtime_error(
+                    "Invalid value in distance matrix file: " + token);
+            }
+        }
+        if (!row.empty())
+            mat.push_back(std::move(row));
+    }
+
+    if (mat.empty())
+        throw std::runtime_error(
+            "No data found in distance matrix file: " + path);
+
+    // Verify the matrix is square.
+    const std::size_t n = mat.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (mat[i].size() != n)
+            throw std::runtime_error(
+                "Distance matrix is not square (row " + std::to_string(i) +
+                " has " + std::to_string(mat[i].size()) +
+                " columns, expected " + std::to_string(n) + ")");
+    }
+
+    return mat;
+}
+
+// ────────────────────────────────── main ─────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    // Default parameters – all can be overridden via the command line.
+    std::string inputFile  = "cities.txt";
+    std::string outputFile = "result.txt";
+    int         popSize    = 200;
+    int         maxGen     = 500;
+    double      mutRate    = 0.02;
+    std::string distCsvFile;  // empty = compute distances from coordinates
+
+    if (argc >= 2) inputFile   = argv[1];
+    if (argc >= 3) outputFile  = argv[2];
+    if (argc >= 4) popSize     = std::atoi(argv[3]);
+    if (argc >= 5) maxGen      = std::atoi(argv[4]);
+    if (argc >= 6) mutRate     = std::atof(argv[5]);
+    if (argc >= 7) distCsvFile = argv[6];
+
+    // ── build or load distance matrix ────────────────────────────────────────
+    std::vector<std::vector<double>> distMatrix;
+    int numCities = 0;
+
+    if (!distCsvFile.empty()) {
+        // Use pre-calculated distances from CSV; city coordinates not needed.
+        try {
+            distMatrix = readDistMatrix(distCsvFile);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[error] " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        numCities = static_cast<int>(distMatrix.size());
+        std::cout << "Loaded pre-calculated distance matrix for "
+                  << numCities << " cities.\n";
+    } else {
+        // Compute distances from city coordinates.
+        std::vector<City> cities;
+        try {
+            cities = readCities(inputFile);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[error] " << e.what() << "\n";
+            return EXIT_FAILURE;
+        }
+        numCities = static_cast<int>(cities.size());
+        std::cout << "Loaded " << numCities << " cities.\n";
+        distMatrix = buildDistanceMatrix(cities);
+    }
+
+    // ── initialise population ────────────────────────────────────────────────
+    std::mt19937 masterRng(std::random_device{}());
+    auto population = initPopulation(popSize, numCities, masterRng);
+
+    // ── evolution loop ───────────────────────────────────────────────────────
+    // Use at most as many threads as individuals so no thread gets an empty slice.
+    const int hwThreads  = static_cast<int>(std::thread::hardware_concurrency());
+    const int numThreads = std::max(1, std::min(hwThreads, popSize));
+
+    Tour   bestTour;
+    double bestLength = std::numeric_limits<double>::max();
+
+    std::cout << std::left
+              << std::setw(10) << "Gen"
+              << std::setw(20) << "Best length"
+              << "Best tour (first 10 cities)\n"
+              << std::string(60, '-') << "\n";
+
+    for (int gen = 0; gen < maxGen; ++gen) {
+        // Evaluate every tour's total length (fitness = shorter is better).
+        std::vector<double> fitness(popSize);
+        for (int i = 0; i < popSize; ++i)
+            fitness[i] = tourLength(population[i], distMatrix);
+
+        // Track the global best individual.
+        const int eliteIdx = static_cast<int>(
+            std::min_element(fitness.begin(), fitness.end()) - fitness.begin());
+        if (fitness[eliteIdx] < bestLength) {
+            bestLength = fitness[eliteIdx];
+            bestTour   = population[eliteIdx];
+            // Locally optimise the new best tour with 2-opt so that
+            // elitism propagates an improved solution each generation.
+            twoOptImprove(bestTour, distMatrix);
+            bestLength = tourLength(bestTour, distMatrix);
+        }
+
+        // Log progress at the first generation, every 50 thereafter, and at the end.
+        if (gen == 0 || gen % 50 == 0 || gen == maxGen - 1) {
+            std::cout << std::left
+                      << std::setw(10) << gen
+                      << std::fixed << std::setprecision(2)
+                      << std::setw(20) << bestLength;
+            // Print up to the first 10 city indices of the best tour.
+            const int preview = std::min(10, numCities);
+            for (int k = 0; k < preview; ++k)
+                std::cout << bestTour[k] << (k + 1 < preview ? "-" : "");
+            if (numCities > 10) std::cout << "-...";
+            std::cout << "\n";
+        }
+
+        // Build the next generation in parallel.
+        // Chunk boundaries are computed so that together they cover [0, popSize)
+        // exactly – no thread receives an empty range.
+        std::vector<Tour> nextPop(popSize);
+        std::vector<std::thread> threads;
+        threads.reserve(numThreads);
+
+        const int chunkSize = popSize / numThreads;
+        const int remainder = popSize % numThreads;
+        int lo = 0;
+        for (int t = 0; t < numThreads; ++t) {
+            const int hi = lo + chunkSize + (t < remainder ? 1 : 0);
+            threads.emplace_back(evolveChunk,
+                                 std::cref(population),
+                                 std::cref(fitness),
+                                 std::ref(nextPop),
+                                 mutRate,
+                                 lo,
+                                 hi,
+                                 masterRng() ^ static_cast<unsigned>(t));
+            lo = hi;
+        }
+        for (auto& thr : threads)
+            thr.join();
+
+        // Elitism: overwrite the worst individual in the new generation with
+        // the best individual from the current generation.
+        const int worstIdx = static_cast<int>(
+            std::max_element(fitness.begin(), fitness.end()) - fitness.begin());
+        nextPop[worstIdx] = bestTour;
+
+        population = std::move(nextPop);
+    }
+
+    // ── print final summary ──────────────────────────────────────────────────
+    std::cout << "\nEvolution complete.\n";
+    std::cout << "Best tour length: " << std::fixed << std::setprecision(4)
+              << bestLength << "\n";
+
+    // ── write result to file ─────────────────────────────────────────────────
+    try {
+        writeTour(outputFile, bestTour, bestLength);
+        std::cout << "Result written to " << outputFile << "\n";
+    } catch (const std::runtime_error& e) {
+        std::cerr << "[error] " << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
