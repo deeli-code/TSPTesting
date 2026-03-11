@@ -383,6 +383,8 @@ static std::vector<std::vector<double>> readDistMatrix(const std::string& path) 
 // ────────────────────────────────── main ─────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    std::cout << "Hello! Welcome to the TSP Solver.\n\n";
+
     // Default parameters – all can be overridden via the command line.
     std::string inputFile  = "cities.txt";
     std::string outputFile = "result.txt";
